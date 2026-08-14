@@ -189,9 +189,10 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 	)
 
 	testCases := []struct {
-		name           string
-		config         *configv1.TLSSecurityProfile
-		expectedGroups []string
+		name               string
+		config             *configv1.TLSSecurityProfile
+		expectedGroups     []string
+		wantAugmentWarning bool
 	}{
 		{
 			name:           "NoAPIServerConfig",
@@ -265,6 +266,26 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 			// "UnknownFutureGroup" is always dropped (unknown to Go). Under FIPS
 			// X25519 is dropped too, leaving nothing.
 			expectedGroups: pick([]string{"X25519"}, []string{}),
+		},
+		{
+			// The footgun case: only a TLS 1.3-only ML-KEM hybrid, but the floor
+			// still permits TLS 1.2. Non-FIPS: the hybrid survives filtering, so
+			// the fail-safe appends classical fallback groups and warns. FIPS:
+			// the hybrid is not approved and is dropped, leaving nothing (no
+			// fallback, path omitted) so the operand uses its own defaults.
+			name: "CustomProfileMLKEMOnlyWithTLS12FloorGetsFallback",
+			config: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: configv1.VersionTLS12,
+						Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+						Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519MLKEM768},
+					},
+				},
+			},
+			expectedGroups:     pick([]string{"X25519MLKEM768", "X25519", "secp256r1", "secp384r1"}, []string{}),
+			wantAugmentWarning: !fips,
 		},
 	}
 
@@ -340,6 +361,18 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 			}
 			if _, found, _ := unstructured.NestedStringSlice(result, cipherSuitesPath...); !found {
 				t.Errorf("cipherSuites missing from result; group observation must not drop sibling fields")
+			}
+
+			// The fail-safe must warn (and only warn) when it augments the
+			// admin's groups with a classical fallback.
+			sawAugmentWarning := false
+			for _, ev := range recorder.Events() {
+				if strings.Contains(ev.Message, "appended classical fallback") {
+					sawAugmentWarning = true
+				}
+			}
+			if sawAugmentWarning != tc.wantAugmentWarning {
+				t.Errorf("augment warning emitted = %v, want %v", sawAugmentWarning, tc.wantAugmentWarning)
 			}
 
 			// Verify the result is pruned to only the observed paths
