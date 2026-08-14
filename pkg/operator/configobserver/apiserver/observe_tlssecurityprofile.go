@@ -100,7 +100,7 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 	}
 
 	if len(groupsPath) > 0 {
-		observedGroups := getSecurityProfileGroups(apiServer.Spec.TLSSecurityProfile)
+		observedGroups, groupsAugmented := getSecurityProfileGroups(apiServer.Spec.TLSSecurityProfile)
 		// Only store the groups path when we actually have groups to set.
 		//
 		// An empty list must be treated as "no opinion". The openshift/api
@@ -115,14 +115,26 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 				return existingConfig, append(errs, err)
 			}
 		}
-		// Emit an event only on a meaningful change. On the first reconcile
-		// currentGroups is nil (the path does not exist yet) while observedGroups
-		// is a non-nil empty slice; the previous reflect.DeepEqual comparison
-		// treated those as different and fired a spurious "groups changed to []"
-		// event on every fresh cluster. groupsEqual collapses the nil-vs-empty
-		// distinction so only real changes are reported.
-		if !groupsEqual(observedGroups, currentGroups) {
+		// Emit events only on a meaningful change, gated identically for the
+		// change notice and the augmentation warning so both fire on transitions
+		// rather than on every resync. On the first reconcile currentGroups is nil
+		// (the path does not exist yet) while observedGroups is a non-nil empty
+		// slice; groupsEqual collapses that nil-vs-empty distinction so a fresh
+		// cluster with no groups does not look like a change.
+		groupsChanged := !groupsEqual(observedGroups, currentGroups)
+		if groupsChanged {
 			recorder.Eventf("ObserveTLSSecurityProfile", "groups changed to %q", observedGroups)
+		}
+		// A custom profile whose groups are all TLS 1.3-only (ML-KEM hybrids)
+		// while minTLSVersion still permits TLS 1.2 would silently break 1.2
+		// handshakes. getSecurityProfileGroups appends a classical fallback in
+		// that case; surface it as a warning so the admin knows their profile was
+		// augmented rather than honored verbatim. Only warn on a change, otherwise
+		// every reconcile of a steady-state augmented profile would spam warnings.
+		if groupsAugmented && groupsChanged {
+			recorder.Warningf("ObserveTLSSecurityProfile",
+				"TLS profile groups were all TLS 1.3-only but minTLSVersion permits TLS 1.2; "+
+					"appended classical fallback groups so TLS 1.2 handshakes can complete: %q", observedGroups)
 		}
 	}
 
@@ -186,12 +198,30 @@ func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []
 // or not FIPS-approved (when running in FIPS mode) are silently dropped — the
 // dropping policy now lives in crypto.FilterTLSGroups so it stays next to the
 // group-to-curve mapping and the FIPS allowlist it depends on.
-func getSecurityProfileGroups(profile *configv1.TLSSecurityProfile) []string {
+//
+// It also fails safe: if the remaining groups are all TLS 1.3-only but the
+// profile's minTLSVersion permits TLS 1.2, a classical fallback is appended so
+// TLS 1.2 handshakes can still complete (see crypto.EnsureHandshakeCapableGroups).
+// The second return value reports whether that fallback was injected, so the
+// caller can emit a warning.
+func getSecurityProfileGroups(profile *configv1.TLSSecurityProfile) ([]string, bool) {
 	profileSpec := resolveProfileSpec(profile)
-	filtered := crypto.FilterTLSGroups(profileSpec.Groups, crypto.IsFIPSEnabled())
-	groups := make([]string, 0, len(filtered))
-	for _, g := range filtered {
+	fips := crypto.IsFIPSEnabled()
+
+	filtered := crypto.FilterTLSGroups(profileSpec.Groups, fips)
+	// Resolve minTLSVersion defensively: the API validates it as an enum and the
+	// named profiles are well-formed, but an observer must never panic on config
+	// input, so fall back to the default rather than using TLSVersionOrDie.
+	minVersion, err := crypto.TLSVersion(string(profileSpec.MinTLSVersion))
+	if err != nil {
+		klog.V(2).Infof("unexpected minTLSVersion %q, using default for fail-safe curve check: %v", profileSpec.MinTLSVersion, err)
+		minVersion = crypto.DefaultTLSVersion()
+	}
+	safe, augmented := crypto.EnsureHandshakeCapableGroups(filtered, minVersion, fips)
+
+	groups := make([]string, 0, len(safe))
+	for _, g := range safe {
 		groups = append(groups, string(g))
 	}
-	return groups
+	return groups, augmented
 }
