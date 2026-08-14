@@ -139,14 +139,17 @@ func groupsEqual(a, b []string) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-// Extracts the minimum TLS version and cipher suites from TLSSecurityProfile object,
-// Converts the ciphers to IANA names as supported by Kube ServingInfo config.
-// If profile is nil (e.g. APIServer/cluster not found), returns the Intermediate TLS Profile defaults.
-func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []string) {
-	var profileType configv1.TLSProfileType
-	if profile == nil {
-		profileType = crypto.DefaultTLSProfileType
-	} else {
+// resolveProfileSpec returns the effective TLSProfileSpec for a
+// TLSSecurityProfile. Named profiles (Old/Intermediate/Modern) resolve from the
+// well-known openshift/api table; a Custom profile uses its inline spec. When
+// the profile is nil (e.g. APIServer/cluster not found) or is Custom-typed
+// without an actual custom spec, it falls back to the Intermediate default.
+//
+// This was previously duplicated verbatim in getSecurityProfileCiphers and
+// getSecurityProfileGroups; it is factored out so the two observers cannot drift.
+func resolveProfileSpec(profile *configv1.TLSSecurityProfile) *configv1.TLSProfileSpec {
+	profileType := crypto.DefaultTLSProfileType
+	if profile != nil {
 		profileType = profile.Type
 	}
 
@@ -159,11 +162,18 @@ func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []
 		profileSpec = configv1.TLSProfiles[profileType]
 	}
 
-	// nothing found / custom type set but no actual custom spec
+	// nothing found / custom type set but no actual custom spec / empty type
 	if profileSpec == nil {
 		profileSpec = configv1.TLSProfiles[crypto.DefaultTLSProfileType]
 	}
+	return profileSpec
+}
 
+// Extracts the minimum TLS version and cipher suites from TLSSecurityProfile object,
+// Converts the ciphers to IANA names as supported by Kube ServingInfo config.
+// If profile is nil (e.g. APIServer/cluster not found), returns the Intermediate TLS Profile defaults.
+func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []string) {
+	profileSpec := resolveProfileSpec(profile)
 	// need to remap all Ciphers to their respective IANA names used by Go
 	return string(profileSpec.MinTLSVersion), crypto.OpenSSLToIANACipherSuites(profileSpec.Ciphers)
 }
@@ -173,39 +183,14 @@ func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []
 // openshift/api and can be passed directly to operands that accept group names as
 // CLI arguments. If profile is nil (e.g. APIServer/cluster not found), returns the
 // Intermediate TLS Profile defaults. Groups not recognised by the current Go runtime
-// or not FIPS-approved (when running in FIPS mode) are silently dropped.
+// or not FIPS-approved (when running in FIPS mode) are silently dropped — the
+// dropping policy now lives in crypto.FilterTLSGroups so it stays next to the
+// group-to-curve mapping and the FIPS allowlist it depends on.
 func getSecurityProfileGroups(profile *configv1.TLSSecurityProfile) []string {
-	var profileType configv1.TLSProfileType
-	if profile == nil {
-		profileType = crypto.DefaultTLSProfileType
-	} else {
-		profileType = profile.Type
-	}
-
-	var profileSpec *configv1.TLSProfileSpec
-	if profileType == configv1.TLSProfileCustomType {
-		if profile.Custom != nil {
-			profileSpec = &profile.Custom.TLSProfileSpec
-		}
-	} else {
-		profileSpec = configv1.TLSProfiles[profileType]
-	}
-
-	if profileSpec == nil {
-		profileSpec = configv1.TLSProfiles[crypto.DefaultTLSProfileType]
-	}
-
-	fips := crypto.IsFIPSEnabled()
-	groups := make([]string, 0, len(profileSpec.Groups))
-	for _, g := range profileSpec.Groups {
-		if _, ok := crypto.TLSGroupToCurveID(g); !ok {
-			klog.V(4).Infof("Dropping TLS group %q: not supported by Go's crypto/tls", g)
-			continue
-		}
-		if fips && !crypto.IsFIPSApprovedTLSGroup(g) {
-			klog.V(4).Infof("Dropping TLS group %q: not FIPS-approved", g)
-			continue
-		}
+	profileSpec := resolveProfileSpec(profile)
+	filtered := crypto.FilterTLSGroups(profileSpec.Groups, crypto.IsFIPSEnabled())
+	groups := make([]string, 0, len(filtered))
+	for _, g := range filtered {
 		groups = append(groups, string(g))
 	}
 	return groups
