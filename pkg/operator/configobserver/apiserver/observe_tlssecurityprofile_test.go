@@ -13,6 +13,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
 
+	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/library-go/pkg/operator/events"
 )
 
@@ -158,9 +159,35 @@ func TestObserveTLSSecurityProfile(t *testing.T) {
 }
 
 func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
-	defaultGroups := []string{"X25519MLKEM768", "X25519", "secp256r1", "secp384r1"}
+	// IMPORTANT: the set of TLS groups the observer emits depends on whether the
+	// Go runtime is in FIPS mode. X25519 and every ML-KEM post-quantum hybrid
+	// (X25519MLKEM768, ...) are NOT FIPS-approved and are dropped by
+	// getSecurityProfileGroups when crypto.IsFIPSEnabled() is true. The original
+	// version of this test hard-coded the non-FIPS expectations, so all but one
+	// subtest failed under `GODEBUG=fips140=on` — i.e. red on every FIPS CI lane,
+	// and the FIPS-filtering branch (the whole point of the feature) was never
+	// actually exercised. We therefore key each expectation off the live FIPS
+	// state so the suite is correct in both modes AND genuinely covers the FIPS
+	// path when run under fips140=on.
+	fips := crypto.IsFIPSEnabled()
 
-	tests := []struct {
+	// pick returns the FIPS or non-FIPS expectation for the current runtime.
+	pick := func(nonFIPS, fipsMode []string) []string {
+		if fips {
+			return fipsMode
+		}
+		return nonFIPS
+	}
+
+	// The default (Old/Intermediate/Modern/absent) profiles all advertise the
+	// same groups; under FIPS the non-approved X25519MLKEM768 and X25519 are
+	// stripped, leaving only the NIST P-curves.
+	defaultGroups := pick(
+		[]string{"X25519MLKEM768", "X25519", "secp256r1", "secp384r1"},
+		[]string{"secp256r1", "secp384r1"},
+	)
+
+	testCases := []struct {
 		name           string
 		config         *configv1.TLSSecurityProfile
 		expectedGroups []string
@@ -219,7 +246,8 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 					},
 				},
 			},
-			expectedGroups: []string{"X25519", "secp256r1"},
+			// Under FIPS the non-approved X25519 is dropped, leaving secp256r1.
+			expectedGroups: pick([]string{"X25519", "secp256r1"}, []string{"secp256r1"}),
 		},
 		{
 			name: "CustomProfileWithUnknownGroup",
@@ -233,7 +261,9 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 					},
 				},
 			},
-			expectedGroups: []string{"X25519"}, // "UnknownFutureGroup" must be dropped
+			// "UnknownFutureGroup" is always dropped (unknown to Go). Under FIPS
+			// X25519 is dropped too, leaving nothing.
+			expectedGroups: pick([]string{"X25519"}, []string{}),
 		},
 	}
 
@@ -241,13 +271,13 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 	cipherSuitesPath := []string{"olmTLS", "cipherSuites"}
 	groupsPath := []string{"olmTLS", "curvePreferences"}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
 			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
-			if tt.config != nil {
+			if tc.config != nil {
 				if err := indexer.Add(&configv1.APIServer{
 					ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
-					Spec:       configv1.APIServerSpec{TLSSecurityProfile: tt.config},
+					Spec:       configv1.APIServerSpec{TLSSecurityProfile: tc.config},
 				}); err != nil {
 					t.Fatal(err)
 				}
@@ -271,8 +301,17 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 				t.Errorf("couldn't get groups from result: %v", err)
 			}
 
-			if !reflect.DeepEqual(gotGroups, tt.expectedGroups) {
-				t.Errorf("got groups = %v, expected %v", gotGroups, tt.expectedGroups)
+			if !reflect.DeepEqual(gotGroups, tc.expectedGroups) {
+				t.Errorf("got groups = %v, expected %v", gotGroups, tc.expectedGroups)
+			}
+
+			// The group observer must not clobber the sibling fields: minTLSVersion
+			// and cipherSuites still have to be written alongside the groups.
+			if _, found, _ := unstructured.NestedString(result, minTLSVersionPath...); !found {
+				t.Errorf("minTLSVersion missing from result; group observation must not drop sibling fields")
+			}
+			if _, found, _ := unstructured.NestedStringSlice(result, cipherSuitesPath...); !found {
+				t.Errorf("cipherSuites missing from result; group observation must not drop sibling fields")
 			}
 
 			// Verify the result is pruned to only the observed paths
