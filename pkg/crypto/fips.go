@@ -16,6 +16,35 @@ import (
 // by default until they complete formal NIST validation (typically years), so
 // any future group absent from this set is correctly excluded without requiring
 // a library-go update.
+//
+// KNOWN DIVERGENCE (revisit as part of native Go FIPS adoption, HPSTRAT-723).
+// Three sources disagree about the FIPS status of some groups, and this
+// allowlist deliberately takes the strictest position:
+//
+//		group           openshift/api godoc     this allowlist   Go native FIPS (fips140=on)
+//		X25519          "keep" (only            drops            REFUSES ("no supported
+//		                 X25519MLKEM768 should                     elliptic curves for ECDHE")
+//		                 be ignored in FIPS)
+//		X25519MLKEM768  "ignore in FIPS"        drops            NEGOTIATES it
+//
+//	  - On plain X25519 this allowlist matches the runtime (both exclude it); the
+//	    openshift/api godoc is the outdated one (corrected in OCPBUGS-109794).
+//	  - On X25519MLKEM768 this allowlist is stricter than Go: Go's module will
+//	    negotiate the hybrid, but we drop it because the hybrid embeds X25519 and
+//	    the FIPS status of ML-KEM hybrids is still settling (SP 800-56C key
+//	    derivation guidance). Empirically confirmed with a probe under
+//	    GODEBUG=fips140=on on Go 1.26; TestFIPSApprovalMatchesRuntime guards this
+//	    so we notice if a toolchain bump changes it.
+//
+// This set is intentionally strict (P-curves only) while operands run mixed
+// crypto backends (OpenSSL FIPS + Go native): it is the safe intersection and
+// never offers a curve an OpenSSL-backed operand would reject. It should be
+// revisited once native Go FIPS is the backend — likely deferring to the
+// module's approved set for Go operands and allowing the P-curve+ML-KEM hybrids
+// (SecP256r1MLKEM768, SecP384r1MLKEM1024; both halves are NIST-approved), keeping
+// an explicit filter only for non-Go / OpenSSL-backed operands. X25519MLKEM768
+// stays excluded even then, because its classical half is the non-NIST curve.
+// Tracked in CNTRLPLANE-4107 (under HPSTRAT-723).
 var fipsTLSGroups = map[configv1.TLSGroup]struct{}{
 	configv1.TLSGroupSecP256r1: {},
 	configv1.TLSGroupSecP384r1: {},
