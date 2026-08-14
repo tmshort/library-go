@@ -101,15 +101,42 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 
 	if len(groupsPath) > 0 {
 		observedGroups := getSecurityProfileGroups(apiServer.Spec.TLSSecurityProfile)
-		if err = unstructured.SetNestedStringSlice(observedConfig, observedGroups, groupsPath...); err != nil {
-			return existingConfig, append(errs, err)
+		// Only store the groups path when we actually have groups to set.
+		//
+		// An empty list must be treated as "no opinion". The openshift/api
+		// contract states that an omitted groups field lets the platform choose
+		// reasonable defaults, whereas persisting an explicit empty [] can be
+		// misread by an operand as "no curves permitted" — which fails every TLS
+		// handshake. So when filtering leaves us with nothing (e.g. a custom
+		// profile with only non-FIPS groups on a FIPS cluster), we leave the path
+		// unset and let the operand fall back to its own defaults.
+		if len(observedGroups) > 0 {
+			if err = unstructured.SetNestedStringSlice(observedConfig, observedGroups, groupsPath...); err != nil {
+				return existingConfig, append(errs, err)
+			}
 		}
-		if !reflect.DeepEqual(observedGroups, currentGroups) {
+		// Emit an event only on a meaningful change. On the first reconcile
+		// currentGroups is nil (the path does not exist yet) while observedGroups
+		// is a non-nil empty slice; the previous reflect.DeepEqual comparison
+		// treated those as different and fired a spurious "groups changed to []"
+		// event on every fresh cluster. groupsEqual collapses the nil-vs-empty
+		// distinction so only real changes are reported.
+		if !groupsEqual(observedGroups, currentGroups) {
 			recorder.Eventf("ObserveTLSSecurityProfile", "groups changed to %q", observedGroups)
 		}
 	}
 
 	return observedConfig, errs
+}
+
+// groupsEqual compares two TLS group-name slices treating nil and empty as
+// equal. This prevents a first reconcile (currentGroups nil) against an empty
+// observation from being mistaken for a change.
+func groupsEqual(a, b []string) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // Extracts the minimum TLS version and cipher suites from TLSSecurityProfile object,

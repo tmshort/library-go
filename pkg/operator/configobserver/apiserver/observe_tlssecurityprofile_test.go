@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,9 +285,10 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 			}
 			listers := testLister{apiLister: configlistersv1.NewAPIServerLister(indexer)}
 
+			recorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
 			result, errs := ObserveTLSSecurityProfileWithGroupPaths(
 				listers,
-				events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now())),
+				recorder,
 				map[string]interface{}{},
 				minTLSVersionPath,
 				cipherSuitesPath,
@@ -296,13 +298,39 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 				t.Errorf("expected 0 errors, got %v", errs)
 			}
 
-			gotGroups, _, err := unstructured.NestedStringSlice(result, groupsPath...)
+			gotGroups, found, err := unstructured.NestedStringSlice(result, groupsPath...)
 			if err != nil {
 				t.Errorf("couldn't get groups from result: %v", err)
 			}
 
-			if !reflect.DeepEqual(gotGroups, tc.expectedGroups) {
-				t.Errorf("got groups = %v, expected %v", gotGroups, tc.expectedGroups)
+			if len(tc.expectedGroups) == 0 {
+				// An empty result must omit the path entirely (no explicit []),
+				// so the operand falls back to platform defaults rather than
+				// interpreting [] as "no curves permitted".
+				if found {
+					t.Errorf("expected groups path to be omitted for an empty result, but found %v", gotGroups)
+				}
+				// ...and omitting the path on a first reconcile must NOT emit a
+				// spurious "groups changed to []" event.
+				for _, ev := range recorder.Events() {
+					if strings.Contains(ev.Message, "groups changed") {
+						t.Errorf("unexpected groups-changed event for empty result: %q", ev.Message)
+					}
+				}
+			} else {
+				if !reflect.DeepEqual(gotGroups, tc.expectedGroups) {
+					t.Errorf("got groups = %v, expected %v", gotGroups, tc.expectedGroups)
+				}
+				// A real (non-empty) first observation should report the change.
+				sawEvent := false
+				for _, ev := range recorder.Events() {
+					if strings.Contains(ev.Message, "groups changed") {
+						sawEvent = true
+					}
+				}
+				if !sawEvent {
+					t.Errorf("expected a groups-changed event for %v, got none", tc.expectedGroups)
+				}
 			}
 
 			// The group observer must not clobber the sibling fields: minTLSVersion
@@ -321,5 +349,54 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestObserveTLSSecurityProfileWithGroupPathsSteadyState verifies that a
+// reconcile whose observed non-empty groups already match the persisted groups
+// emits NO "groups changed" event. The table test above always starts from an
+// empty existingConfig (currentGroups == nil), so it only ever exercises the
+// nil-vs-empty short-circuit and the "changed from nothing" path of groupsEqual;
+// the reflect.DeepEqual "equal, non-empty -> suppress" branch — the actual point
+// of the change-suppression fix — is never hit there. This test feeds a prior
+// observation back in to exercise exactly that branch. It is FIPS-agnostic: the
+// default profile yields a non-empty group list in both modes.
+func TestObserveTLSSecurityProfileWithGroupPathsSteadyState(t *testing.T) {
+	minTLSVersionPath := []string{"olmTLS", "minTLSVersion"}
+	cipherSuitesPath := []string{"olmTLS", "cipherSuites"}
+	groupsPath := []string{"olmTLS", "curvePreferences"}
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	listers := testLister{apiLister: configlistersv1.NewAPIServerLister(indexer)}
+
+	// First reconcile from empty establishes the observed groups (and expectedly
+	// fires a change event).
+	first, errs := ObserveTLSSecurityProfileWithGroupPaths(
+		listers,
+		events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now())),
+		map[string]interface{}{},
+		minTLSVersionPath, cipherSuitesPath, groupsPath,
+	)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors on first reconcile: %v", errs)
+	}
+	observed, found, err := unstructured.NestedStringSlice(first, groupsPath...)
+	if err != nil || !found || len(observed) == 0 {
+		t.Fatalf("expected a non-empty observed groups list, got found=%v groups=%v err=%v", found, observed, err)
+	}
+
+	// Second reconcile fed the first result back in as existingConfig: groups are
+	// unchanged, so no "groups changed" event must fire (DeepEqual branch of
+	// groupsEqual returning true).
+	recorder := events.NewInMemoryRecorder(t.Name(), clocktesting.NewFakePassiveClock(time.Now()))
+	if _, errs = ObserveTLSSecurityProfileWithGroupPaths(
+		listers, recorder, first, minTLSVersionPath, cipherSuitesPath, groupsPath,
+	); len(errs) > 0 {
+		t.Fatalf("unexpected errors on second reconcile: %v", errs)
+	}
+	for _, ev := range recorder.Events() {
+		if strings.Contains(ev.Message, "groups changed") {
+			t.Errorf("steady-state reconcile emitted a spurious groups-changed event: %q", ev.Message)
+		}
 	}
 }
