@@ -66,10 +66,13 @@ func canNegotiateGroup(t *testing.T, cert tls.Certificate, curve tls.CurveID) er
 			serverResult <- aerr
 			return
 		}
-		serverResult <- conn.(*tls.Conn).HandshakeContext(ctx)
-		if cerr := conn.Close(); cerr != nil {
-			t.Logf("server conn close: %v", cerr)
-		}
+		hsErr := conn.(*tls.Conn).HandshakeContext(ctx)
+		// Close before signaling completion so the goroutine is fully done by the
+		// time the caller reads serverResult, and never call t.Logf here: it could
+		// otherwise run after the test function has returned and panic. The close
+		// error is irrelevant to the drift assertion, so it is ignored.
+		_ = conn.Close()
+		serverResult <- hsErr
 	}()
 
 	dialer := &tls.Dialer{
