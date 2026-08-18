@@ -193,6 +193,7 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 		config             *configv1.TLSSecurityProfile
 		expectedGroups     []string
 		wantAugmentWarning bool
+		wantDropWarning    bool
 	}{
 		{
 			name:           "NoAPIServerConfig",
@@ -264,8 +265,10 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 				},
 			},
 			// "UnknownFutureGroup" is always dropped (unknown to Go). Under FIPS
-			// X25519 is dropped too, leaving nothing.
-			expectedGroups: pick([]string{"X25519"}, []string{}),
+			// X25519 is dropped too, leaving nothing — so under FIPS the admin's
+			// configured groups are all dropped and the observer warns.
+			expectedGroups:  pick([]string{"X25519"}, []string{}),
+			wantDropWarning: fips,
 		},
 		{
 			// The footgun case: only a TLS 1.3-only ML-KEM hybrid, but the floor
@@ -286,6 +289,9 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 			},
 			expectedGroups:     pick([]string{"X25519MLKEM768", "X25519", "secp256r1", "secp384r1"}, []string{}),
 			wantAugmentWarning: !fips,
+			// Under FIPS the sole configured group is dropped, so the observer warns
+			// that all configured groups were dropped instead.
+			wantDropWarning: fips,
 		},
 	}
 
@@ -373,6 +379,18 @@ func TestObserveTLSSecurityProfileWithGroupPaths(t *testing.T) {
 			}
 			if sawAugmentWarning != tc.wantAugmentWarning {
 				t.Errorf("augment warning emitted = %v, want %v", sawAugmentWarning, tc.wantAugmentWarning)
+			}
+
+			// When the admin configured groups but all were dropped (unsupported /
+			// non-FIPS), the observer must warn rather than silently fall back.
+			sawDropWarning := false
+			for _, ev := range recorder.Events() {
+				if strings.Contains(ev.Message, "all configured TLS groups were dropped") {
+					sawDropWarning = true
+				}
+			}
+			if sawDropWarning != tc.wantDropWarning {
+				t.Errorf("drop warning emitted = %v, want %v", sawDropWarning, tc.wantDropWarning)
 			}
 
 			// Verify the result is pruned to only the observed paths

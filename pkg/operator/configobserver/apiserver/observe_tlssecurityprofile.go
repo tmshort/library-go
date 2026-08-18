@@ -44,11 +44,11 @@ func ObserveTLSSecurityProfileToArguments(genericListers configobserver.Listers,
 // When groupsPath is non-nil, TLS group preferences are also observed and stored at that path.
 func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, recorder events.Recorder, existingConfig map[string]interface{}, minTLSVersionPath, cipherSuitesPath, groupsPath []string) (ret map[string]interface{}, _ []error) {
 	defer func() {
+		paths := [][]string{minTLSVersionPath, cipherSuitesPath}
 		if len(groupsPath) > 0 {
-			ret = configobserver.Pruned(ret, minTLSVersionPath, cipherSuitesPath, groupsPath)
-		} else {
-			ret = configobserver.Pruned(ret, minTLSVersionPath, cipherSuitesPath)
+			paths = append(paths, groupsPath)
 		}
+		ret = configobserver.Pruned(ret, paths...)
 	}()
 
 	listers := genericListers.(APIServerLister)
@@ -83,8 +83,12 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 		return existingConfig, append(errs, err)
 	}
 
+	// Resolve the effective profile spec once and share it between the cipher and
+	// group extractors (previously each re-resolved it).
+	profileSpec := resolveProfileSpec(apiServer.Spec.TLSSecurityProfile)
+
 	observedConfig := map[string]interface{}{}
-	observedMinTLSVersion, observedCipherSuites := getSecurityProfileCiphers(apiServer.Spec.TLSSecurityProfile)
+	observedMinTLSVersion, observedCipherSuites := getSecurityProfileCiphers(profileSpec)
 	if err = unstructured.SetNestedField(observedConfig, observedMinTLSVersion, minTLSVersionPath...); err != nil {
 		return existingConfig, append(errs, err)
 	}
@@ -100,7 +104,7 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 	}
 
 	if len(groupsPath) > 0 {
-		observedGroups, groupsAugmented := getSecurityProfileGroups(apiServer.Spec.TLSSecurityProfile)
+		observedGroups, groupsAugmented, groupsDropped := getSecurityProfileGroups(profileSpec)
 		// Only store the groups path when we actually have groups to set.
 		//
 		// An empty list must be treated as "no opinion". The openshift/api
@@ -115,15 +119,20 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 				return existingConfig, append(errs, err)
 			}
 		}
-		// Emit events only on a meaningful change, gated identically for the
-		// change notice and the augmentation warning so both fire on transitions
-		// rather than on every resync. On the first reconcile currentGroups is nil
-		// (the path does not exist yet) while observedGroups is a non-nil empty
-		// slice; groupsEqual collapses that nil-vs-empty distinction so a fresh
-		// cluster with no groups does not look like a change.
+		// Emit the change notice and augmentation warning only on a transition. On
+		// the first reconcile currentGroups is nil (the path does not exist yet)
+		// while observedGroups is a non-nil empty slice; groupsEqual collapses that
+		// nil-vs-empty distinction so a fresh cluster with no groups does not look
+		// like a change.
 		groupsChanged := !groupsEqual(observedGroups, currentGroups)
 		if groupsChanged {
-			recorder.Eventf("ObserveTLSSecurityProfile", "groups changed to %q", observedGroups)
+			if len(observedGroups) == 0 {
+				// The path is omitted (never written as []), so describe the effect
+				// accurately rather than claiming "changed to []".
+				recorder.Eventf("ObserveTLSSecurityProfile", "groups cleared; operand will use its default groups")
+			} else {
+				recorder.Eventf("ObserveTLSSecurityProfile", "groups changed to %q", observedGroups)
+			}
 		}
 		// A custom profile whose groups are all TLS 1.3-only (ML-KEM hybrids)
 		// while minTLSVersion still permits TLS 1.2 would silently break 1.2
@@ -135,6 +144,19 @@ func innerTLSSecurityProfileObservations(genericListers configobserver.Listers, 
 			recorder.Warningf("ObserveTLSSecurityProfile",
 				"TLS profile groups were all TLS 1.3-only but minTLSVersion permits TLS 1.2; "+
 					"appended classical fallback groups so TLS 1.2 handshakes can complete: %q", observedGroups)
+		}
+		// Symmetry with the augmentation warning: if the admin configured groups
+		// but every one was dropped (unsupported by this Go build, or not
+		// FIPS-approved under FIPS), the operand silently falls back to its own
+		// defaults — most notably an all-PQ Custom profile on a FIPS cluster. Warn
+		// so that is visible rather than a silent no-op. This is intentionally NOT
+		// gated on groupsChanged: on a fresh cluster the drop is a standing state
+		// with no transition to detect, and the event recorder aggregates repeats.
+		// (A status condition would be the durable indicator, but that belongs to
+		// the operator, not this observer.)
+		if groupsDropped {
+			recorder.Warningf("ObserveTLSSecurityProfile",
+				"all configured TLS groups were dropped (unsupported by this runtime or not FIPS-approved); the operand will use its default groups")
 		}
 	}
 
@@ -157,8 +179,8 @@ func groupsEqual(a, b []string) bool {
 // the profile is nil (e.g. APIServer/cluster not found) or is Custom-typed
 // without an actual custom spec, it falls back to the Intermediate default.
 //
-// This was previously duplicated verbatim in getSecurityProfileCiphers and
-// getSecurityProfileGroups; it is factored out so the two observers cannot drift.
+// It is resolved once per reconcile in innerTLSSecurityProfileObservations and
+// shared by the cipher and group extractors so the two cannot drift.
 func resolveProfileSpec(profile *configv1.TLSSecurityProfile) *configv1.TLSProfileSpec {
 	profileType := crypto.DefaultTLSProfileType
 	if profile != nil {
@@ -181,31 +203,32 @@ func resolveProfileSpec(profile *configv1.TLSSecurityProfile) *configv1.TLSProfi
 	return profileSpec
 }
 
-// Extracts the minimum TLS version and cipher suites from TLSSecurityProfile object,
-// Converts the ciphers to IANA names as supported by Kube ServingInfo config.
-// If profile is nil (e.g. APIServer/cluster not found), returns the Intermediate TLS Profile defaults.
-func getSecurityProfileCiphers(profile *configv1.TLSSecurityProfile) (string, []string) {
-	profileSpec := resolveProfileSpec(profile)
+// getSecurityProfileCiphers extracts the minimum TLS version and cipher suites
+// from the resolved profile spec, remapping ciphers to the IANA names used by the
+// Kube ServingInfo config.
+func getSecurityProfileCiphers(profileSpec *configv1.TLSProfileSpec) (string, []string) {
 	// need to remap all Ciphers to their respective IANA names used by Go
 	return string(profileSpec.MinTLSVersion), crypto.OpenSSLToIANACipherSuites(profileSpec.Ciphers)
 }
 
-// getSecurityProfileGroups returns the TLS group preference names for the given
-// TLSSecurityProfile as []string. The strings match the TLSGroup constants from
+// getSecurityProfileGroups returns the TLS group preference names for the resolved
+// profile spec as []string. The strings match the TLSGroup constants from
 // openshift/api and can be passed directly to operands that accept group names as
-// CLI arguments. If profile is nil (e.g. APIServer/cluster not found), returns the
-// Intermediate TLS Profile defaults. Groups not recognised by the current Go runtime
-// or not FIPS-approved (when running in FIPS mode) are silently dropped — the
-// dropping policy now lives in crypto.FilterTLSGroups so it stays next to the
-// group-to-curve mapping and the FIPS allowlist it depends on.
+// CLI arguments. Groups not recognised by the current Go runtime or not
+// FIPS-approved (when running in FIPS mode) are dropped — the dropping policy lives
+// in crypto.FilterTLSGroups so it stays next to the group-to-curve mapping and the
+// FIPS allowlist it depends on.
 //
 // It also fails safe: if the remaining groups are all TLS 1.3-only but the
 // profile's minTLSVersion permits TLS 1.2, a classical fallback is appended so
 // TLS 1.2 handshakes can still complete (see crypto.EnsureHandshakeCapableGroups).
-// The second return value reports whether that fallback was injected, so the
-// caller can emit a warning.
-func getSecurityProfileGroups(profile *configv1.TLSSecurityProfile) ([]string, bool) {
-	profileSpec := resolveProfileSpec(profile)
+//
+// Return values:
+//   - augmented: a classical fallback was injected (the profile was not honored verbatim).
+//   - droppedAll: the profile configured groups but none survived filtering (so the
+//     operand will fall back to its own defaults). Distinct from "no groups
+//     configured", which is a legitimate "no opinion".
+func getSecurityProfileGroups(profileSpec *configv1.TLSProfileSpec) ([]string, bool, bool) {
 	fips := crypto.IsFIPSEnabled()
 
 	filtered := crypto.FilterTLSGroups(profileSpec.Groups, fips)
@@ -219,9 +242,11 @@ func getSecurityProfileGroups(profile *configv1.TLSSecurityProfile) ([]string, b
 	}
 	safe, augmented := crypto.EnsureHandshakeCapableGroups(filtered, minVersion, fips)
 
+	droppedAll := len(profileSpec.Groups) > 0 && len(safe) == 0
+
 	groups := make([]string, 0, len(safe))
 	for _, g := range safe {
 		groups = append(groups, string(g))
 	}
-	return groups, augmented
+	return groups, augmented, droppedAll
 }
