@@ -28,6 +28,11 @@ import (
 // Dropped groups are logged at V(4). The returned slice is always non-nil-safe
 // for range but may be empty; callers must decide what an empty result means
 // (typically: fall back to platform defaults rather than offering no curves).
+//
+// Recognition ("known to this Go build") is decided by TLSGroupToCurveID, the
+// same source TLSGroupsToCurveIDs uses, so the two cannot disagree about which
+// groups exist; FilterTLSGroups only layers the FIPS filter and name-slice return
+// on top.
 func FilterTLSGroups(groups []configv1.TLSGroup, fips bool) []configv1.TLSGroup {
 	filtered := make([]configv1.TLSGroup, 0, len(groups))
 	for _, g := range groups {

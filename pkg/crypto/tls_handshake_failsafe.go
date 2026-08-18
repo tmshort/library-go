@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"crypto/tls"
+	"slices"
 
 	configv1 "github.com/openshift/api/config/v1"
 )
@@ -17,18 +18,21 @@ var tls12CapableGroups = map[configv1.TLSGroup]bool{
 	configv1.TLSGroupSecP521r1: true,
 }
 
-// classicalHandshakeFallbackGroups is the fallback appended when a TLS 1.2
-// handshake would otherwise be impossible. It mirrors the classical portion of
-// the shipped Old/Intermediate/Modern profiles.
+// classicalHandshakeFallbackGroups is the non-FIPS fallback appended when a TLS
+// 1.2 handshake would otherwise be impossible. It mirrors the classical portion
+// of the shipped Old/Intermediate/Modern profiles (X25519, secp256r1, secp384r1),
+// which is why it deliberately does NOT include secp521r1 — those profiles do not
+// list it either.
 var classicalHandshakeFallbackGroups = []configv1.TLSGroup{
 	configv1.TLSGroupX25519,
 	configv1.TLSGroupSecP256r1,
 	configv1.TLSGroupSecP384r1,
 }
 
-// fipsHandshakeFallbackGroups is the FIPS-mode fallback. X25519 is not
-// FIPS-approved, so it is excluded; this matches the cluster-ingress-operator
-// precedent of falling back to secp256r1:secp384r1:secp521r1 (see TRT-2597).
+// fipsHandshakeFallbackGroups is the FIPS-mode fallback. It deliberately differs
+// from classicalHandshakeFallbackGroups: X25519 is dropped (not FIPS-approved) and
+// secp521r1 is included, matching the cluster-ingress-operator precedent of
+// falling back to secp256r1:secp384r1:secp521r1 (see TRT-2597).
 var fipsHandshakeFallbackGroups = []configv1.TLSGroup{
 	configv1.TLSGroupSecP256r1,
 	configv1.TLSGroupSecP384r1,
@@ -68,12 +72,38 @@ var fipsHandshakeFallbackGroups = []configv1.TLSGroup{
 //
 // The function is idempotent: feeding its own output back in returns
 // injected=false, because the result now contains a classical group.
-func EnsureHandshakeCapableGroups(groups []configv1.TLSGroup, minVersion uint16, fips bool) (result []configv1.TLSGroup, injected bool) {
+//
+// Intended input, and why it is fips-aware:
+//
+// This operates on the groups a caller intends to OFFER; it does not itself drop
+// groups for Go-support or FIPS (use FilterTLSGroups for that). Two caller shapes
+// exist, which is why the fips parameter and the FIPS fallback exist:
+//
+//   - Pre-filtered caller (the config observer). getSecurityProfileGroups runs
+//     FilterTLSGroups(fips) first, so under FIPS the survivors are already
+//     P-curves (all TLS 1.2-capable) or the list is empty. There the FIPS branch
+//     below is effectively a no-op; FIPS safety comes from FilterTLSGroups plus
+//     the observer omitting an empty list so the operand uses its own defaults.
+//
+//   - Unfiltered caller (a component building a tls.Config directly, letting Go
+//     apply FIPS at negotiation). There this helper is the one that must supply a
+//     FIPS-safe classical fallback, so it needs the fips flag. For example:
+//
+//     spec, _ := GetTLSProfileSpec(profile)
+//     min, _ := TLSVersion(string(spec.MinTLSVersion))
+//     groups, _ := EnsureHandshakeCapableGroups(spec.Groups, min, IsFIPSEnabled())
+//     curves, _ := TLSGroupsToCurveIDs(groups)
+//     tlsConfig.CurvePreferences = curves // Go filters again at negotiation
+//
+// The returned slice is always one the caller fully owns (a distinct copy on
+// every path), so it may be freely appended to or mutated.
+func EnsureHandshakeCapableGroups(groups []configv1.TLSGroup, minVersion uint16, fips bool) ([]configv1.TLSGroup, bool) {
 	if len(groups) == 0 {
-		return groups, false
+		return nil, false
 	}
+	results := slices.Clone(groups)
 	if minVersion >= tls.VersionTLS13 {
-		return groups, false
+		return results, false
 	}
 	for _, g := range groups {
 		if fips && !IsFIPSApprovedTLSGroup(g) {
@@ -81,7 +111,7 @@ func EnsureHandshakeCapableGroups(groups []configv1.TLSGroup, minVersion uint16,
 			continue
 		}
 		if tls12CapableGroups[g] {
-			return groups, false
+			return results, false
 		}
 	}
 
@@ -89,7 +119,5 @@ func EnsureHandshakeCapableGroups(groups []configv1.TLSGroup, minVersion uint16,
 	if fips {
 		fallback = fipsHandshakeFallbackGroups
 	}
-	// Copy first so we never mutate the caller's backing array.
-	result = append(append([]configv1.TLSGroup{}, groups...), fallback...)
-	return result, true
+	return append(results, fallback...), true
 }
